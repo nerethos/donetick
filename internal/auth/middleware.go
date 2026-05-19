@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"donetick.com/core/config"
+	"donetick.com/core/internal/mfa"
 	uModel "donetick.com/core/internal/user/model"
 	uRepo "donetick.com/core/internal/user/repo"
 	"donetick.com/core/logging"
@@ -20,16 +21,16 @@ type signIn struct {
 	Password string `form:"password" json:"password" binding:"required"`
 }
 
-func CurrentUser(c *gin.Context) (*uModel.User, bool) {
+func CurrentUser(c *gin.Context) (*uModel.UserDetails, bool) {
 	data, ok := c.Get(identityKey)
 	if !ok {
 		return nil, false
 	}
-	acc, ok := data.(*uModel.User)
+	acc, ok := data.(*uModel.UserDetails)
 	return acc, ok
 }
 
-func MustCurrentUser(c *gin.Context) *uModel.User {
+func MustCurrentUser(c *gin.Context) *uModel.UserDetails {
 	acc, ok := CurrentUser(c)
 	if ok {
 		return acc
@@ -37,7 +38,7 @@ func MustCurrentUser(c *gin.Context) *uModel.User {
 	panic("no account in gin.Context")
 }
 
-func NewAuthMiddleware(cfg *config.Config, userRepo *uRepo.UserRepository) (*jwt.GinJWTMiddleware, error) {
+func NewAuthMiddleware(cfg *config.Config, userRepo *uRepo.UserRepository, mfaService *mfa.MFAService) (*jwt.GinJWTMiddleware, error) {
 	return jwt.New(&jwt.GinJWTMiddleware{
 		Realm:       "test zone",
 		Key:         []byte(cfg.Jwt.Secret),
@@ -45,7 +46,7 @@ func NewAuthMiddleware(cfg *config.Config, userRepo *uRepo.UserRepository) (*jwt
 		MaxRefresh:  cfg.Jwt.MaxRefresh, // 7 days as long as their token is valid they can refresh it
 		IdentityKey: identityKey,
 		PayloadFunc: func(data interface{}) jwt.MapClaims {
-			if u, ok := data.(*uModel.User); ok {
+			if u, ok := data.(*uModel.UserDetails); ok {
 				return jwt.MapClaims{
 					identityKey: u.Username,
 				}
@@ -85,22 +86,56 @@ func NewAuthMiddleware(cfg *config.Config, userRepo *uRepo.UserRepository) (*jwt
 					}
 					return nil, jwt.ErrFailedAuthentication
 				}
-				return &uModel.User{
-					ID:        user.ID,
-					Username:  user.Username,
-					Password:  "",
-					Image:     user.Image,
-					CreatedAt: user.CreatedAt,
-					UpdatedAt: user.UpdatedAt,
-					Disabled:  user.Disabled,
-					CircleID:  user.CircleID,
+
+				// Check if MFA is enabled for this user
+				if user.MFAEnabled {
+					// Create MFA session for verification
+					sessionToken, err := mfaService.GenerateSessionToken()
+					if err != nil {
+						logging.FromContext(c).Errorw("Failed to generate MFA session token", "error", err)
+						return nil, jwt.ErrFailedAuthentication
+					}
+
+					mfaSession := &uModel.MFASession{
+						SessionToken: sessionToken,
+						UserID:       user.ID,
+						AuthMethod:   "local",
+						Verified:     false,
+						CreatedAt:    time.Now().UTC(),
+						ExpiresAt:    time.Now().UTC().Add(10 * time.Minute), // 10-minute expiry
+						UserData:     user.Username,                          // Store username for later verification
+					}
+
+					if err := userRepo.CreateMFASession(c.Request.Context(), mfaSession); err != nil {
+						logging.FromContext(c).Errorw("Failed to create MFA session", "error", err)
+						return nil, jwt.ErrFailedAuthentication
+					}
+
+					// Return special error to indicate MFA is required
+					c.Set("mfa_required", true)
+					c.Set("mfa_session_token", sessionToken)
+					return nil, NewMFARequiredError()
+				}
+
+				return &uModel.UserDetails{
+					User: uModel.User{
+						ID:        user.ID,
+						Username:  user.Username,
+						Password:  "",
+						Image:     user.Image,
+						CreatedAt: user.CreatedAt,
+						UpdatedAt: user.UpdatedAt,
+						Disabled:  user.Disabled,
+						CircleID:  user.CircleID,
+					},
+					WebhookURL: user.WebhookURL,
 				}, nil
 			case "3rdPartyAuth":
 				// we should only reach this stage if a handler mannually call authenticator with it's context:
 
-				var authObject *uModel.User
+				var authObject *uModel.UserDetails
 				v := c.Value("user_account")
-				authObject = v.(*uModel.User)
+				authObject = v.(*uModel.UserDetails)
 
 				return authObject, nil
 
@@ -111,26 +146,46 @@ func NewAuthMiddleware(cfg *config.Config, userRepo *uRepo.UserRepository) (*jwt
 
 		Authorizator: func(data interface{}, c *gin.Context) bool {
 
-			if _, ok := data.(*uModel.User); ok {
+			if _, ok := data.(*uModel.UserDetails); ok {
 				return true
 			}
 			return false
 		},
 		Unauthorized: func(c *gin.Context, code int, message string) {
 			logging.FromContext(c).Info("middleware.jwt.Unauthorized", "code", code, "message", message)
+
+			// Check if MFA is required
+			if mfaRequired, exists := c.Get("mfa_required"); exists && mfaRequired.(bool) {
+				sessionToken, _ := c.Get("mfa_session_token")
+				c.JSON(http.StatusOK, gin.H{
+					"mfaRequired":  true,
+					"sessionToken": sessionToken,
+				})
+				return
+			}
+
 			c.JSON(code, gin.H{
 				"code":    code,
 				"message": message,
 			})
+			c.Abort()
 		},
 		LoginResponse: func(c *gin.Context, code int, token string, expire time.Time) {
+			// Check if MFA is required
+			if mfaRequired, exists := c.Get("mfa_required"); exists && mfaRequired.(bool) {
+				sessionToken, _ := c.Get("mfa_session_token")
+				c.JSON(http.StatusOK, gin.H{
+					"mfaRequired":  true,
+					"sessionToken": sessionToken,
+				})
+				return
+			}
 			c.JSON(http.StatusOK, gin.H{
 				"code":   code,
 				"token":  token,
 				"expire": expire,
 			})
 		},
-		TokenLookup:   "header: Authorization",
 		TokenHeadName: "Bearer",
 		TimeFunc:      time.Now,
 	})

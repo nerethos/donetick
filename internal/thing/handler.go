@@ -4,24 +4,25 @@ import (
 	"strconv"
 	"time"
 
-	auth "donetick.com/core/internal/authorization"
+	auth "donetick.com/core/internal/auth"
 	chRepo "donetick.com/core/internal/chore/repo"
 	cRepo "donetick.com/core/internal/circle/repo"
+	"donetick.com/core/internal/events"
 	nRepo "donetick.com/core/internal/notifier/repo"
 	nps "donetick.com/core/internal/notifier/service"
 	tModel "donetick.com/core/internal/thing/model"
 	tRepo "donetick.com/core/internal/thing/repo"
 	"donetick.com/core/logging"
-	jwt "github.com/appleboy/gin-jwt/v2"
 	"github.com/gin-gonic/gin"
 )
 
 type Handler struct {
-	choreRepo  *chRepo.ChoreRepository
-	circleRepo *cRepo.CircleRepository
-	nPlanner   *nps.NotificationPlanner
-	nRepo      *nRepo.NotificationRepository
-	tRepo      *tRepo.ThingRepository
+	choreRepo      *chRepo.ChoreRepository
+	circleRepo     *cRepo.CircleRepository
+	nPlanner       *nps.NotificationPlanner
+	nRepo          *nRepo.NotificationRepository
+	tRepo          *tRepo.ThingRepository
+	eventsProducer *events.EventsProducer
 }
 
 type ThingRequest struct {
@@ -32,16 +33,32 @@ type ThingRequest struct {
 }
 
 func NewHandler(cr *chRepo.ChoreRepository, circleRepo *cRepo.CircleRepository,
-	np *nps.NotificationPlanner, nRepo *nRepo.NotificationRepository, tRepo *tRepo.ThingRepository) *Handler {
+	np *nps.NotificationPlanner, nRepo *nRepo.NotificationRepository, tRepo *tRepo.ThingRepository, eventsProducer *events.EventsProducer) *Handler {
 	return &Handler{
-		choreRepo:  cr,
-		circleRepo: circleRepo,
-		nPlanner:   np,
-		nRepo:      nRepo,
-		tRepo:      tRepo,
+		choreRepo:      cr,
+		circleRepo:     circleRepo,
+		nPlanner:       np,
+		nRepo:          nRepo,
+		tRepo:          tRepo,
+		eventsProducer: eventsProducer,
 	}
 }
 
+// CreateThing godoc
+//
+//	@Summary		Create a new thing
+//	@Description	Creates a new thing for the current user with the given name, type, and optional state
+//	@Tags			things
+//	@Accept			json
+//	@Produce		json
+//	@Security		JWTKeyAuth
+//	@Security		APIKeyAuth
+//	@Param			thing	body		ThingRequest			true	"Thing creation request"
+//	@Success		201		{object}	map[string]tModel.Thing	"res: created thing object"
+//	@Failure		400		{object}	map[string]string		"error: Invalid request | Invalid state"
+//	@Failure		401		{object}	map[string]string		"error: Unauthorized"
+//	@Failure		500		{object}	map[string]string		"error: Failed to create thing"
+//	@Router			/things [post]
 func (h *Handler) CreateThing(c *gin.Context) {
 	log := logging.FromContext(c)
 	currentUser, ok := auth.CurrentUser(c)
@@ -75,6 +92,23 @@ func (h *Handler) CreateThing(c *gin.Context) {
 	})
 }
 
+// UpdateThingState godoc
+//
+//	@Summary		Update thing state
+//	@Description	Updates the state of a thing by ID and triggers any associated chore due dates
+//	@Tags			things
+//	@Accept			json
+//	@Produce		json
+//	@Security		JWTKeyAuth
+//	@Security		APIKeyAuth
+//	@Param			id		path		int						true	"Thing ID"
+//	@Param			value	query		string					true	"New state value"
+//	@Success		200		{object}	map[string]tModel.Thing	"res: updated thing object"
+//	@Failure		400		{object}	map[string]string		"error: Invalid thing id | value query param is required | Invalid state"
+//	@Failure		401		{object}	map[string]string		"error: Unauthorized"
+//	@Failure		403		{object}	map[string]string		"error: Forbidden"
+//	@Failure		500		{object}	map[string]string		"error: Unable to find thing | Failed to update state"
+//	@Router			/things/{id}/state [put]
 func (h *Handler) UpdateThingState(c *gin.Context) {
 	currentUser, ok := auth.CurrentUser(c)
 	if !ok {
@@ -95,6 +129,7 @@ func (h *Handler) UpdateThingState(c *gin.Context) {
 		return
 	}
 	thing, err := h.tRepo.GetThingByID(c, thingID)
+	old_state := thing.State
 	if thing.UserID != currentUser.ID {
 		c.JSON(403, gin.H{"error": "Forbidden"})
 		return
@@ -118,6 +153,13 @@ func (h *Handler) UpdateThingState(c *gin.Context) {
 	if shouldReturn {
 		return
 	}
+	h.eventsProducer.ThingsUpdated(c.Request.Context(), currentUser.WebhookURL, map[string]interface{}{
+		"id":         thing.ID,
+		"name":       thing.Name,
+		"type":       thing.Type,
+		"from_state": old_state,
+		"to_state":   val,
+	})
 
 	c.JSON(200, gin.H{
 		"res": thing,
@@ -133,12 +175,32 @@ func EvaluateTriggerAndScheduleDueDate(h *Handler, c *gin.Context, thing *tModel
 	for _, tc := range thingChores {
 		triggered := EvaluateThingChore(tc, thing.State)
 		if triggered {
-			h.choreRepo.SetDueDateIfNotExisted(c, tc.ChoreID, time.Now().UTC())
+			err := h.choreRepo.SetDueDateIfNotExisted(c, tc.ChoreID, time.Now().UTC())
+			if err != nil {
+				c.JSON(500, gin.H{"error": err.Error()})
+				return true
+			}
 		}
 	}
 	return false
 }
 
+// UpdateThing godoc
+//
+//	@Summary		Update a thing
+//	@Description	Updates the name, type, and optionally the state of an existing thing
+//	@Tags			things
+//	@Accept			json
+//	@Produce		json
+//	@Security		JWTKeyAuth
+//	@Security		APIKeyAuth
+//	@Param			thing	body		ThingRequest			true	"Thing update request"
+//	@Success		200		{object}	map[string]tModel.Thing	"res: updated thing object"
+//	@Failure		400		{object}	map[string]string		"error: Invalid request | Invalid state"
+//	@Failure		401		{object}	map[string]string		"error: Unauthorized"
+//	@Failure		403		{object}	map[string]string		"error: Forbidden"
+//	@Failure		500		{object}	map[string]string		"error: Unable to find thing | Failed to update thing"
+//	@Router			/things [put]
 func (h *Handler) UpdateThing(c *gin.Context) {
 	currentUser, ok := auth.CurrentUser(c)
 	if !ok {
@@ -181,6 +243,19 @@ func (h *Handler) UpdateThing(c *gin.Context) {
 	})
 }
 
+// GetAllThings godoc
+//
+//	@Summary		Get all things
+//	@Description	Retrieves all things belonging to the current user
+//	@Tags			things
+//	@Accept			json
+//	@Produce		json
+//	@Security		JWTKeyAuth
+//	@Security		APIKeyAuth
+//	@Success		200	{object}	map[string][]interface{}	"res: array of things"
+//	@Failure		401	{object}	map[string]string			"error: Unauthorized"
+//	@Failure		500	{object}	map[string]string			"error: Failed to retrieve things"
+//	@Router			/things [get]
 func (h *Handler) GetAllThings(c *gin.Context) {
 	currentUser, ok := auth.CurrentUser(c)
 	if !ok {
@@ -198,6 +273,23 @@ func (h *Handler) GetAllThings(c *gin.Context) {
 	})
 }
 
+// GetThingHistory godoc
+//
+//	@Summary		Get thing history
+//	@Description	Retrieves the state change history for a specific thing with pagination offset
+//	@Tags			things
+//	@Accept			json
+//	@Produce		json
+//	@Security		JWTKeyAuth
+//	@Security		APIKeyAuth
+//	@Param			id		path		int						true	"Thing ID"
+//	@Param			offset	query		int						true	"Pagination offset"
+//	@Success		200		{object}	map[string]interface{}	"res: thing history entries"
+//	@Failure		400		{object}	map[string]string		"error: Invalid thing id | Invalid offset"
+//	@Failure		401		{object}	map[string]string		"error: Unauthorized"
+//	@Failure		403		{object}	map[string]string		"error: Forbidden"
+//	@Failure		500		{object}	map[string]string		"error: Unable to find thing | Failed to retrieve history"
+//	@Router			/things/{id}/history [get]
 func (h *Handler) GetThingHistory(c *gin.Context) {
 	currentUser, ok := auth.CurrentUser(c)
 	if !ok {
@@ -238,6 +330,23 @@ func (h *Handler) GetThingHistory(c *gin.Context) {
 	})
 }
 
+// DeleteThing godoc
+//
+//	@Summary		Delete a thing
+//	@Description	Deletes a thing by ID; fails if there are chores still associated with it
+//	@Tags			things
+//	@Accept			json
+//	@Produce		json
+//	@Security		JWTKeyAuth
+//	@Security		APIKeyAuth
+//	@Param			id	path		int					true	"Thing ID"
+//	@Success		200	{object}	nil					"empty response on success"
+//	@Failure		400	{object}	map[string]string	"error: Invalid thing id"
+//	@Failure		401	{object}	map[string]string	"error: Unauthorized"
+//	@Failure		403	{object}	map[string]string	"error: Forbidden"
+//	@Failure		405	{object}	map[string]string	"error: Unable to delete thing with associated tasks"
+//	@Failure		500	{object}	map[string]string	"error: Unable to find thing | Unable to find tasks linked to this thing | Failed to delete thing"
+//	@Router			/things/{id} [delete]
 func (h *Handler) DeleteThing(c *gin.Context) {
 	currentUser, ok := auth.CurrentUser(c)
 	if !ok {
@@ -261,7 +370,6 @@ func (h *Handler) DeleteThing(c *gin.Context) {
 		c.JSON(403, gin.H{"error": "Forbidden"})
 		return
 	}
-	//  confirm there are no chores associated with the thing:
 	thingChores, err := h.tRepo.GetThingChoresByThingId(c, thing.ID)
 	if err != nil {
 		c.JSON(500, gin.H{"error": "Unable to find tasks linked to this thing"})
@@ -277,10 +385,10 @@ func (h *Handler) DeleteThing(c *gin.Context) {
 	}
 	c.JSON(200, gin.H{})
 }
-func Routes(r *gin.Engine, h *Handler, auth *jwt.GinJWTMiddleware) {
 
-	thingRoutes := r.Group("things")
-	thingRoutes.Use(auth.MiddlewareFunc())
+func Routes(r *gin.Engine, h *Handler, multiAuthMiddleware *auth.MultiAuthMiddleware) {
+	thingRoutes := r.Group("api/v1/things")
+	thingRoutes.Use(multiAuthMiddleware.MiddlewareFunc())
 	{
 		thingRoutes.POST("", h.CreateThing)
 		thingRoutes.PUT("/:id/state", h.UpdateThingState)
