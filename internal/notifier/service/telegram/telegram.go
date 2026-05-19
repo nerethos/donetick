@@ -2,7 +2,6 @@ package telegram
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -38,20 +37,16 @@ func (tn *TelegramNotifier) SendChoreCompletion(c context.Context, chore *chMode
 		log.Error("Telegram bot is not initialized, Skipping sending message")
 		return
 	}
-	var mt *chModel.NotificationMetadata
-	if err := json.Unmarshal([]byte(*chore.NotificationMetadata), &mt); err != nil {
-		log.Error("Error unmarshalling notification metadata", err)
-	}
 
 	targets := []int64{}
 	if user.ChatID != 0 {
 		targets = append(targets, user.ChatID)
 	}
-	if mt.CircleGroup && mt.CircleGroupID != nil {
+	if chore.NotificationMetadataV2.CircleGroup && chore.NotificationMetadataV2.CircleGroupID != nil {
 		// attempt to parse it:
 
-		if *mt.CircleGroupID != 0 {
-			targets = append(targets, *mt.CircleGroupID)
+		if *chore.NotificationMetadataV2.CircleGroupID != 0 {
+			targets = append(targets, *chore.NotificationMetadataV2.CircleGroupID)
 		}
 
 	}
@@ -70,12 +65,10 @@ func (tn *TelegramNotifier) SendChoreCompletion(c context.Context, chore *chMode
 
 }
 
-func (tn *TelegramNotifier) SendNotification(c context.Context, notification *nModel.Notification) error {
-
+func (tn *TelegramNotifier) SendNotification(c context.Context, notification *nModel.NotificationDetails) error {
 	log := logging.FromContext(c)
 	if notification.TargetID == "" {
-		log.Error("Notification target ID is empty")
-		return errors.New("Notification target ID is empty")
+		return errors.New("unable to send notification, targetID is empty")
 	}
 	chatID, err := strconv.ParseInt(notification.TargetID, 10, 64)
 	if err != nil {

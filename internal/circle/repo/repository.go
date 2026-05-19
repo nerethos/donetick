@@ -2,9 +2,12 @@ package repo
 
 import (
 	"context"
+	"time"
 
 	cModel "donetick.com/core/internal/circle/model"
+	pModel "donetick.com/core/internal/points"
 	uModel "donetick.com/core/internal/user/model"
+	"donetick.com/core/logging"
 	"gorm.io/gorm"
 )
 
@@ -36,14 +39,21 @@ func (r *CircleRepository) CreateCircle(c context.Context, circle *cModel.Circle
 }
 
 func (r *CircleRepository) AddUserToCircle(c context.Context, circleUser *cModel.UserCircle) error {
-	return r.db.WithContext(c).Save(circleUser).Error
+	// Use FirstOrCreate to handle the unique constraint
+	// This will create the record if it doesn't exist, or return the existing one
+	result := r.db.WithContext(c).Where(cModel.UserCircle{
+		UserID:   circleUser.UserID,
+		CircleID: circleUser.CircleID,
+	}).FirstOrCreate(circleUser)
+
+	return result.Error
 }
 
 func (r *CircleRepository) GetCircleUsers(c context.Context, circleID int) ([]*cModel.UserCircleDetail, error) {
 	var circleUsers []*cModel.UserCircleDetail
 	if err := r.db.WithContext(c).
 		Table("user_circles uc").
-		Select("uc.*, u.username, u.display_name, u.chat_id,  unt.user_id as user_id, unt.target_id as target_id, unt.type as notification_type").
+		Select("uc.*, u.username, u.display_name, u.chat_id, u.image, unt.user_id as user_id, unt.target_id as target_id, unt.type as notification_type").
 		Joins("left join users u on u.id = uc.user_id").
 		Joins("left join user_notification_targets unt on unt.user_id = u.id").
 		Where("uc.circle_id = ?", circleID).
@@ -78,8 +88,14 @@ func (r *CircleRepository) DeleteUserFromCircle(c context.Context, circleID, use
 	return r.db.WithContext(c).Where("circle_id = ? AND user_id = ?", circleID, userID).Delete(&cModel.UserCircle{}).Error
 }
 
-func (r *CircleRepository) ChangeUserRole(c context.Context, circleID, userID int, role int) error {
+func (r *CircleRepository) ChangeUserRole(c context.Context, circleID, userID int, role cModel.Role) error {
 	return r.db.WithContext(c).Model(&cModel.UserCircle{}).Where("circle_id = ? AND user_id = ?", circleID, userID).Update("role", role).Error
+}
+
+func (r *CircleRepository) GetUserCircleRole(c context.Context, circleID, userID int) (cModel.Role, error) {
+	var role cModel.Role
+	err := r.db.WithContext(c).Model(&cModel.UserCircle{}).Select("role").Where("circle_id = ? AND user_id = ?", circleID, userID).Scan(&role).Error
+	return role, err
 }
 
 func (r *CircleRepository) GetCircleByInviteCode(c context.Context, inviteCode string) (*cModel.Circle, error) {
@@ -124,7 +140,9 @@ func (r *CircleRepository) GetCircleAdmins(c context.Context, circleID int) ([]*
 
 func (r *CircleRepository) GetDefaultCircle(c context.Context, userID int) (*cModel.Circle, error) {
 	var circle cModel.Circle
-	if err := r.db.WithContext(c).Raw("SELECT circles.* FROM circles LEFT JOIN user_circles on circles.id = user_circles.circle_id WHERE user_circles.user_id = ? AND user_circles.role = 'admin'", userID).Scan(&circle).Error; err != nil {
+	if err := r.db.WithContext(c).
+		Raw("SELECT circles.* FROM circles LEFT JOIN user_circles ON circles.id = user_circles.circle_id WHERE user_circles.user_id = ? AND user_circles.role = 'admin' ORDER BY user_circles.created_at ASC LIMIT 1", userID).
+		Scan(&circle).Error; err != nil {
 		return nil, err
 	}
 	return &circle, nil
@@ -137,4 +155,34 @@ func (r *CircleRepository) AssignDefaultCircle(c context.Context, userID int) er
 	}
 
 	return r.db.WithContext(c).Model(&uModel.User{}).Where("id = ?", userID).Update("circle_id", defaultCircle.ID).Error
+}
+
+func (r *CircleRepository) RedeemPoints(c context.Context, circleID int, userID int, points int, createdBy int) error {
+	logger := logging.FromContext(c)
+	err := r.db.Transaction(func(tx *gorm.DB) error {
+
+		if err := tx.Model(&cModel.UserCircle{}).Where("user_id = ? AND circle_id = ?", userID, circleID).Update("points_redeemed", gorm.Expr("points_redeemed + ?", points)).Error; err != nil {
+			return err
+		}
+		if err := tx.Create(&pModel.PointsHistory{
+			Action:    pModel.PointsHistoryActionRedeem,
+			CircleID:  circleID,
+			UserID:    userID,
+			Points:    points,
+			CreatedAt: time.Now().UTC(),
+			CreatedBy: createdBy,
+		}).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		logger.Error("Error redeeming points", err)
+		return err
+	}
+	return nil
+}
+
+func (r *CircleRepository) SetWebhookURL(c context.Context, circleID int, webhookURL *string) error {
+	return r.db.WithContext(c).Model(&cModel.Circle{}).Where("id = ?", circleID).Update("webhook_url", webhookURL).Error
 }

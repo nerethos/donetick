@@ -7,42 +7,81 @@ import (
 	"fmt"
 	"html"
 	"net/http"
+	"strings"
 	"time"
 
 	"donetick.com/core/config"
-	auth "donetick.com/core/internal/authorization"
+	auth "donetick.com/core/internal/auth"
+	"donetick.com/core/internal/auth/apple"
 	cModel "donetick.com/core/internal/circle/model"
 	cRepo "donetick.com/core/internal/circle/repo"
 	"donetick.com/core/internal/email"
+	"donetick.com/core/internal/mfa"
 	nModel "donetick.com/core/internal/notifier/model"
+	storage "donetick.com/core/internal/storage"
+	storageRepo "donetick.com/core/internal/storage/repo"
 	uModel "donetick.com/core/internal/user/model"
 	uRepo "donetick.com/core/internal/user/repo"
 	"donetick.com/core/internal/utils"
 	"donetick.com/core/logging"
 	jwt "github.com/appleboy/gin-jwt/v2"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	limiter "github.com/ulule/limiter/v3"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/oauth2/v1"
+	"google.golang.org/api/option"
 )
 
 type Handler struct {
 	userRepo               *uRepo.UserRepository
 	circleRepo             *cRepo.CircleRepository
 	jwtAuth                *jwt.GinJWTMiddleware
+	tokenService           *auth.TokenService
 	email                  *email.EmailSender
+	identityProvider       *auth.IdentityProvider
 	isDonetickDotCom       bool
 	IsUserCreationDisabled bool
+	DonetickCloudConfig    config.DonetickCloudConfig
+	storage                *storage.S3Storage
+	storageRepo            *storageRepo.StorageRepository
+	signer                 *storage.URLSignerS3
+	deletionService        *DeletionService
+	appleService           *apple.AppleService
+	mfaService             *mfa.MFAService
+	maxSubaccounts         int
+	plusMaxSubaccounts     int
+	oauth2Config           config.OAuth2Config
+	singleCircleInstance   bool
 }
 
-func NewHandler(ur *uRepo.UserRepository, cr *cRepo.CircleRepository, jwtAuth *jwt.GinJWTMiddleware, email *email.EmailSender, config *config.Config) *Handler {
+func NewHandler(ur *uRepo.UserRepository, cr *cRepo.CircleRepository,
+	jwtAuth *jwt.GinJWTMiddleware, tokenService *auth.TokenService,
+	email *email.EmailSender,
+	idp *auth.IdentityProvider, storage *storage.S3Storage,
+	signer *storage.URLSignerS3, storageRepo *storageRepo.StorageRepository,
+	appleService *apple.AppleService,
+	deletionService *DeletionService, mfaService *mfa.MFAService, config *config.Config) *Handler {
 	return &Handler{
 		userRepo:               ur,
 		circleRepo:             cr,
 		jwtAuth:                jwtAuth,
+		tokenService:           tokenService,
 		email:                  email,
+		identityProvider:       idp,
 		isDonetickDotCom:       config.IsDoneTickDotCom,
 		IsUserCreationDisabled: config.IsUserCreationDisabled,
+		DonetickCloudConfig:    config.DonetickCloudConfig,
+		storage:                storage,
+		storageRepo:            storageRepo,
+		signer:                 signer,
+		deletionService:        deletionService,
+		appleService:           appleService,
+		mfaService:             mfaService,
+		maxSubaccounts:         config.FeatureLimits.MaxSubaccounts,
+		plusMaxSubaccounts:     config.FeatureLimits.PlusMaxSubaccounts,
+		oauth2Config:           config.OAuth2Config,
+		singleCircleInstance:   config.SingleCircleInstance,
 	}
 }
 
@@ -64,6 +103,10 @@ func (h *Handler) GetAllUsers() gin.HandlerFunc {
 			return
 		}
 
+		for i := range users {
+			users[i].Image = h.signer.SignIfLocal(users[i].Image)
+		}
+
 		c.JSON(200, gin.H{
 			"res": users,
 		})
@@ -80,7 +123,7 @@ func (h *Handler) signUp(c *gin.Context) {
 
 	type SignUpReq struct {
 		Username    string `json:"username" binding:"required,min=4,max=20"`
-		Password    string `json:"password" binding:"required,min=8,max=45"`
+		Password    string `json:"password" binding:"required,min=8,max=64"`
 		Email       string `json:"email" binding:"required,email"`
 		DisplayName string `json:"displayName"`
 	}
@@ -94,6 +137,15 @@ func (h *Handler) signUp(c *gin.Context) {
 	if signupReq.DisplayName == "" {
 		signupReq.DisplayName = signupReq.Username
 	}
+
+	// Validate username format
+	if !utils.IsValidUsername(signupReq.Username) {
+		c.JSON(400, gin.H{
+			"error": "Username can only contain lowercase letters (a-z), numbers (0-9), dots (.), and hyphens (-)",
+		})
+		return
+	}
+
 	password, err := auth.EncodePassword(signupReq.Password)
 	signupReq.Username = html.EscapeString(signupReq.Username)
 	signupReq.DisplayName = html.EscapeString(signupReq.DisplayName)
@@ -110,8 +162,8 @@ func (h *Handler) signUp(c *gin.Context) {
 		Password:    password,
 		DisplayName: signupReq.DisplayName,
 		Email:       signupReq.Email,
-		CreatedAt:   time.Now(),
-		UpdatedAt:   time.Now(),
+		CreatedAt:   time.Now().UTC(),
+		UpdatedAt:   time.Now().UTC(),
 	}); err != nil {
 		c.JSON(500, gin.H{
 			"error": "Error creating user, email already exists or username is taken",
@@ -122,8 +174,8 @@ func (h *Handler) signUp(c *gin.Context) {
 	// var userRole string
 	userCircle, err := h.circleRepo.CreateCircle(c, &cModel.Circle{
 		Name:       signupReq.DisplayName + "'s circle",
-		CreatedAt:  time.Now(),
-		UpdatedAt:  time.Now(),
+		CreatedAt:  time.Now().UTC(),
+		UpdatedAt:  time.Now().UTC(),
 		InviteCode: utils.GenerateInviteCode(c),
 	})
 
@@ -139,8 +191,8 @@ func (h *Handler) signUp(c *gin.Context) {
 		CircleID:  userCircle.ID,
 		Role:      "admin",
 		IsActive:  true,
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
 	}); err != nil {
 		c.JSON(500, gin.H{
 			"error": "Error adding user to circle",
@@ -166,9 +218,34 @@ func (h *Handler) GetUserProfile(c *gin.Context) {
 		})
 		return
 	}
+	user.Image = h.signer.SignIfLocal(user.Image)
 	c.JSON(200, gin.H{
 		"res": user,
 	})
+}
+
+func (h *Handler) syncOIDCRole(c *gin.Context, userID, circleID int, groups []string) {
+	logger := logging.FromContext(c)
+	resolvedRole, active := auth.ResolveRoleFromGroups(groups, h.oauth2Config.AdminGroups, h.oauth2Config.ManagerGroups)
+	if !active {
+		return
+	}
+
+	currentRole, err := h.circleRepo.GetUserCircleRole(c, circleID, userID)
+	if err != nil {
+		logger.Warnw("OIDC role sync: failed to get current role", "userID", userID, "circleID", circleID, "err", err)
+		return
+	}
+
+	if currentRole == cModel.Role(resolvedRole) {
+		return
+	}
+
+	if err := h.circleRepo.ChangeUserRole(c, circleID, userID, resolvedRole); err != nil {
+		logger.Errorw("OIDC role sync: failed to update role", "userID", userID, "circleID", circleID, "resolvedRole", resolvedRole, "err", err)
+		return
+	}
+	logger.Infow("OIDC role sync", "userID", userID, "circleID", circleID, "oldRole", currentRole, "newRole", resolvedRole, "groups", groups)
 }
 
 func (h *Handler) thirdPartyAuthCallback(c *gin.Context) {
@@ -178,7 +255,8 @@ func (h *Handler) thirdPartyAuthCallback(c *gin.Context) {
 	provider := c.Param("provider")
 	logger.Infow("account.handler.thirdPartyAuthCallback", "provider", provider)
 
-	if provider == "google" {
+	switch provider {
+	case "google":
 		c.Set("auth_provider", "3rdPartyAuth")
 		type OAuthRequest struct {
 			Token    string `json:"token" binding:"required"`
@@ -194,9 +272,31 @@ func (h *Handler) thirdPartyAuthCallback(c *gin.Context) {
 		}
 
 		// logger.Infow("account.handler.thirdPartyAuthCallback", "token", token)
-		service, err := oauth2.New(http.DefaultClient)
+		service, err := oauth2.NewService(c, option.WithHTTPClient(http.DefaultClient))
+		if err != nil {
+			logger.Errorw("account.handler.thirdPartyAuthCallback failed to create oauth2 service", "err", err)
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": "Authentication service unavailable",
+			})
+			return
+		}
 
-		// tokenInfo, err := service.Tokeninfo().AccessToken(token).Do()
+		tokenInfo, err := service.Tokeninfo().AccessToken(body.Token).Do()
+		if err != nil {
+			logger.Errorw("account.handler.thirdPartyAuthCallback failed to get token info", "err", err)
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "Invalid token",
+			})
+			return
+		}
+		logger.Infow("account.handler.thirdPartyAuthCallback", "tokenInfo", tokenInfo)
+		if tokenInfo.Audience != h.DonetickCloudConfig.GoogleClientID && tokenInfo.Audience != h.DonetickCloudConfig.GoogleIOSClientID && tokenInfo.Audience != h.DonetickCloudConfig.GoogleAndroidClientID {
+			logger.Errorw("account.handler.thirdPartyAuthCallback token audience mismatch", "audience", tokenInfo.Audience)
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "Invalid token",
+			})
+			return
+		}
 		userinfo, err := service.Userinfo.Get().Do(googleapi.QueryParameter("access_token", body.Token))
 		logger.Infow("account.handler.thirdPartyAuthCallback", "tokenInfo", userinfo)
 		if err != nil {
@@ -212,16 +312,23 @@ func (h *Handler) thirdPartyAuthCallback(c *gin.Context) {
 		if err != nil {
 			// create a random password for the user using crypto/rand:
 			password := auth.GenerateRandomPassword(12)
-			encodedPassword, err := auth.EncodePassword(password)
-			acc = &uModel.User{
+			encodedPassword, err := auth.EncodePassword(password) //nolint:ineffassign
+			if err != nil {
+				logger.Errorw("account.handler.thirdPartyAuthCallback failed to encode password", "err", err)
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"error": "Unable to create user account",
+				})
+				return
+			}
+			account := &uModel.User{
 				Username:    userinfo.Id,
 				Email:       userinfo.Email,
 				Image:       userinfo.Picture,
 				Password:    encodedPassword,
 				DisplayName: userinfo.GivenName,
-				Provider:    2,
+				Provider:    uModel.AuthProviderGoogle,
 			}
-			createdUser, err := h.userRepo.CreateUser(c, acc)
+			createdUser, err := h.userRepo.CreateUser(c, account)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{
 					"error": "Unable to create user",
@@ -232,8 +339,8 @@ func (h *Handler) thirdPartyAuthCallback(c *gin.Context) {
 			// Create Circle for the user:
 			userCircle, err := h.circleRepo.CreateCircle(c, &cModel.Circle{
 				Name:       userinfo.GivenName + "'s circle",
-				CreatedAt:  time.Now(),
-				UpdatedAt:  time.Now(),
+				CreatedAt:  time.Now().UTC(),
+				UpdatedAt:  time.Now().UTC(),
 				InviteCode: utils.GenerateInviteCode(c),
 			})
 
@@ -249,8 +356,8 @@ func (h *Handler) thirdPartyAuthCallback(c *gin.Context) {
 				CircleID:  userCircle.ID,
 				Role:      "admin",
 				IsActive:  true,
-				CreatedAt: time.Now(),
-				UpdatedAt: time.Now(),
+				CreatedAt: time.Now().UTC(),
+				UpdatedAt: time.Now().UTC(),
 			}); err != nil {
 				c.JSON(500, gin.H{
 					"error": "Error adding user to circle",
@@ -265,18 +372,423 @@ func (h *Handler) thirdPartyAuthCallback(c *gin.Context) {
 				return
 			}
 		}
-		// use auth to generate a token for the user:
-		c.Set("user_account", acc)
-		h.jwtAuth.Authenticator(c)
-		tokenString, expire, err := h.jwtAuth.TokenGenerator(acc)
+		// Check if user has MFA enabled
+		if acc.MFAEnabled {
+			// Create MFA session for third-party auth
+			sessionToken, err := h.mfaService.GenerateSessionToken()
+			if err != nil {
+				logger.Errorw("Failed to generate MFA session token", "error", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Authentication failed"})
+				return
+			}
+
+			mfaSession := &uModel.MFASession{
+				SessionToken: sessionToken,
+				UserID:       acc.ID,
+				AuthMethod:   "google",
+				Verified:     false,
+				CreatedAt:    time.Now().UTC(),
+				ExpiresAt:    time.Now().UTC().Add(10 * time.Minute),
+				UserData:     acc.Username,
+			}
+
+			if err := h.userRepo.CreateMFASession(c, mfaSession); err != nil {
+				logger.Errorw("Failed to create MFA session", "error", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Authentication failed"})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"mfaRequired":  true,
+				"sessionToken": sessionToken,
+			})
+			return
+		}
+		// Generate tokens including refresh token:
+		tokenResponse, err := h.tokenService.GenerateTokens(c.Request.Context(), acc)
 		if err != nil {
-			logger.Errorw("Unable to Generate a Token")
+			logger.Errorw("Unable to generate tokens", "error", err)
 			c.JSON(http.StatusInternalServerError, gin.H{
 				"error": "Unable to Generate a Token",
 			})
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"token": tokenString, "expire": expire})
+		c.SetCookie("refresh_token", tokenResponse.RefreshToken, int(h.tokenService.RefreshTokenExpiry().Seconds()), "/", "", true, true)
+		c.JSON(http.StatusOK, tokenResponse)
+		return
+	case "apple":
+		c.Set("auth_provider", "3rdPartyAuth")
+		// AppleAuthRequest matches the structure of the incoming Apple auth payload
+		type AppleAuthRequest struct {
+			Provider string `json:"provider" binding:"required"`
+			Data     struct {
+				Provider string `json:"provider"`
+				Result   struct {
+					IDToken     string `json:"idToken"`
+					AccessToken struct {
+						Token string `json:"token"`
+					} `json:"accessToken"`
+					Profile struct {
+						User       string `json:"user"`
+						GivenName  string `json:"givenName"`
+						FamilyName string `json:"familyName"`
+						Email      string `json:"email"`
+					} `json:"profile"`
+				} `json:"result"`
+			} `json:"data"`
+		}
+
+		var body AppleAuthRequest
+		if err := c.ShouldBindJSON(&body); err != nil {
+			logger.Errorw("account.handler.thirdPartyAuthCallback (apple) failed to bind", "err", err)
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "Invalid request",
+			})
+			return
+		}
+
+		// Validate the ID token - use the JWT from accessToken.token, not the short idToken
+		idToken := body.Data.Result.IDToken
+		if idToken == "" || len(idToken) < 100 { // JWT tokens are much longer
+			// Fallback to accessToken.token which contains the actual JWT
+			idToken = body.Data.Result.AccessToken.Token
+		}
+		userInfo, err := h.appleService.ValidateIDToken(c.Request.Context(), idToken)
+		if err != nil {
+			logger.Errorw("account.handler.thirdPartyAuthCallback (apple) failed to validate token", "err", err)
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "Invalid Apple ID token",
+			})
+			return
+		}
+
+		logger.Infow("account.handler.thirdPartyAuthCallback (apple)", "userInfo", userInfo)
+
+		// Check if user exists
+		acc, err := h.userRepo.FindByEmail(c, userInfo.Email)
+
+		if err != nil {
+			// Create user account
+			password := auth.GenerateRandomPassword(12)
+			encodedPassword, err := auth.EncodePassword(password)
+			if err != nil {
+				logger.Errorw("account.handler.thirdPartyAuthCallback (apple) failed to encode password", "err", err)
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"error": "Unable to create user account",
+				})
+				return
+			}
+
+			// Use provided names from profile or fallback to email
+			displayName := body.Data.Result.Profile.GivenName
+			if displayName == "" {
+				displayName = userInfo.Email
+			}
+
+			account := &uModel.User{
+				Username:    userInfo.Sub,
+				Email:       userInfo.Email,
+				Password:    encodedPassword,
+				DisplayName: displayName,
+				Provider:    uModel.AuthProviderApple,
+			}
+
+			createdUser, err := h.userRepo.CreateUser(c, account)
+			if err != nil {
+				logger.Errorw("account.handler.thirdPartyAuthCallback (apple) failed to create user", "err", err)
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"error": "Unable to create user",
+				})
+				return
+			}
+
+			// Create Circle for the user
+			userCircle, err := h.circleRepo.CreateCircle(c, &cModel.Circle{
+				Name:       displayName + "'s circle",
+				CreatedAt:  time.Now().UTC(),
+				UpdatedAt:  time.Now().UTC(),
+				InviteCode: utils.GenerateInviteCode(c),
+			})
+
+			if err != nil {
+				logger.Errorw("account.handler.thirdPartyAuthCallback (apple) failed to create circle", "err", err)
+				c.JSON(500, gin.H{
+					"error": "Error creating circle",
+				})
+				return
+			}
+
+			if err := h.circleRepo.AddUserToCircle(c, &cModel.UserCircle{
+				UserID:    createdUser.ID,
+				CircleID:  userCircle.ID,
+				Role:      "admin",
+				IsActive:  true,
+				CreatedAt: time.Now().UTC(),
+				UpdatedAt: time.Now().UTC(),
+			}); err != nil {
+				logger.Errorw("account.handler.thirdPartyAuthCallback (apple) failed to add user to circle", "err", err)
+				c.JSON(500, gin.H{
+					"error": "Error adding user to circle",
+				})
+				return
+			}
+
+			createdUser.CircleID = userCircle.ID
+			if err := h.userRepo.UpdateUser(c, createdUser); err != nil {
+				logger.Errorw("account.handler.thirdPartyAuthCallback (apple) failed to update user", "err", err)
+				c.JSON(500, gin.H{
+					"error": "Error updating user",
+				})
+				return
+			}
+
+			acc = &uModel.UserDetails{User: *createdUser}
+		}
+
+		// Check if user has MFA enabled
+		if acc.MFAEnabled {
+			// Create MFA session for Apple auth
+			sessionToken, err := h.mfaService.GenerateSessionToken()
+			if err != nil {
+				logger.Errorw("Failed to generate MFA session token", "error", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Authentication failed"})
+				return
+			}
+
+			mfaSession := &uModel.MFASession{
+				SessionToken: sessionToken,
+				UserID:       acc.ID,
+				AuthMethod:   "apple",
+				Verified:     false,
+				CreatedAt:    time.Now().UTC(),
+				ExpiresAt:    time.Now().UTC().Add(10 * time.Minute),
+				UserData:     acc.Username,
+			}
+
+			if err := h.userRepo.CreateMFASession(c, mfaSession); err != nil {
+				logger.Errorw("Failed to create MFA session", "error", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Authentication failed"})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"mfaRequired":  true,
+				"sessionToken": sessionToken,
+			})
+			return
+		}
+
+		// Generate tokens including refresh token:
+		tokenResponse, err := h.tokenService.GenerateTokens(c.Request.Context(), acc)
+		if err != nil {
+			logger.Errorw("Unable to generate tokens for Apple user", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": "Unable to Generate a Token",
+			})
+			return
+		}
+		c.SetCookie("refresh_token", tokenResponse.RefreshToken, int(h.tokenService.RefreshTokenExpiry().Seconds()), "/", "", true, true)
+		c.JSON(http.StatusOK, tokenResponse)
+		return
+	case "oauth2":
+		c.Set("auth_provider", "3rdPartyAuth")
+		// Read the ID token from the request bod
+		type Request struct {
+			Code        string `json:"code"`
+			RedirectURI string `json:"redirect_uri"`
+		}
+		var req Request
+		if err := c.ShouldBindJSON(&req); err != nil {
+			logger.Errorw("account.handler.thirdPartyAuthCallback (oauth2) failed to bind request", "err", err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+			return
+		}
+
+		// Validate that the code is not empty
+		if req.Code == "" {
+			logger.Errorw("account.handler.thirdPartyAuthCallback (oauth2) empty authorization code")
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Authorization code is required"})
+			return
+		}
+
+		logger.Infow("account.handler.thirdPartyAuthCallback (oauth2) attempting to exchange code", "codeLength", len(req.Code), "redirectURI", req.RedirectURI)
+
+		// Pass the redirect URI from the request if provided, otherwise use config default
+		token, err := h.identityProvider.ExchangeToken(c, req.Code, req.RedirectURI)
+
+		if err != nil {
+			logger.Errorw("account.handler.thirdPartyAuthCallback (oauth2) failed to exchange token", "err", err, "code", req.Code[:min(len(req.Code), 10)]+"...")
+			// Return a more specific error message based on the OAuth2 error
+			if strings.Contains(err.Error(), "invalid_grant") {
+				c.JSON(http.StatusBadRequest, gin.H{
+					"error": "Authorization code is invalid, expired, or already used. Please try the authentication process again.",
+				})
+			} else {
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"error": "Failed to exchange authorization code for token",
+				})
+			}
+			return
+		}
+
+		claims, err := h.identityProvider.GetUserInfo(c, token)
+		if err != nil {
+			logger.Error("account.handler.thirdPartyAuthCallback (oauth2) failed to get claims", "err", err)
+		}
+
+		acc, err := h.userRepo.FindByEmail(c, claims.Email)
+		if err != nil {
+			// Create user
+			password := auth.GenerateRandomPassword(12)
+			encodedPassword, err := auth.EncodePassword(password)
+			if err != nil {
+				logger.Error("account.handler.thirdPartyAuthCallback (oauth2) password encoding failed", "err", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Password encoding failed"})
+				return
+			}
+			account := &uModel.User{
+				Username:    claims.Email,
+				Email:       claims.Email,
+				Password:    encodedPassword,
+				Image:       claims.Picture,
+				DisplayName: claims.DisplayName,
+				Provider:    uModel.AuthProviderOAuth2,
+			}
+			createdUser, err := h.userRepo.CreateUser(c, account)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"error": "Unable to create user",
+				})
+				return
+
+			}
+			var circleID int
+			if h.singleCircleInstance {
+				// In single-circle mode, add user to the shared household circle (ID 1).
+				// Create it if it doesn't exist yet (first user bootstraps the circle).
+				sharedCircle, err := h.circleRepo.GetCircleByID(c, 1)
+				if err != nil {
+					sharedCircle, err = h.circleRepo.CreateCircle(c, &cModel.Circle{
+						Name:       "Home",
+						CreatedAt:  time.Now().UTC(),
+						UpdatedAt:  time.Now().UTC(),
+						InviteCode: utils.GenerateInviteCode(c),
+					})
+					if err != nil {
+						c.JSON(500, gin.H{"error": "Error creating shared circle"})
+						return
+					}
+				}
+				circleID = sharedCircle.ID
+
+				// Resolve role from OIDC groups; default to member if no match or no config.
+				role := cModel.UserRole(cModel.RoleMember)
+				if resolvedRole, active := auth.ResolveRoleFromGroups(claims.Groups, h.oauth2Config.AdminGroups, h.oauth2Config.ManagerGroups); active {
+					role = cModel.UserRole(resolvedRole)
+				}
+
+				if err := h.circleRepo.AddUserToCircle(c, &cModel.UserCircle{
+					UserID:    createdUser.ID,
+					CircleID:  circleID,
+					Role:      role,
+					IsActive:  true,
+					CreatedAt: time.Now().UTC(),
+					UpdatedAt: time.Now().UTC(),
+				}); err != nil {
+					c.JSON(500, gin.H{"error": "Error adding user to circle"})
+					return
+				}
+			} else {
+				// Default: create a personal circle for the new user.
+				userCircle, err := h.circleRepo.CreateCircle(c, &cModel.Circle{
+					Name:       claims.DisplayName + "'s circle",
+					CreatedAt:  time.Now().UTC(),
+					UpdatedAt:  time.Now().UTC(),
+					InviteCode: utils.GenerateInviteCode(c),
+				})
+				if err != nil {
+					c.JSON(500, gin.H{"error": "Error creating circle"})
+					return
+				}
+				circleID = userCircle.ID
+
+				if err := h.circleRepo.AddUserToCircle(c, &cModel.UserCircle{
+					UserID:    createdUser.ID,
+					CircleID:  circleID,
+					Role:      "admin",
+					IsActive:  true,
+					CreatedAt: time.Now().UTC(),
+					UpdatedAt: time.Now().UTC(),
+				}); err != nil {
+					c.JSON(500, gin.H{"error": "Error adding user to circle"})
+					return
+				}
+
+				// Sync role from OIDC groups if configured (may demote from admin).
+				h.syncOIDCRole(c, createdUser.ID, circleID, claims.Groups)
+			}
+
+			createdUser.CircleID = circleID
+			if err := h.userRepo.UpdateUser(c, createdUser); err != nil {
+				c.JSON(500, gin.H{
+					"error": "Error updating user",
+				})
+				return
+			}
+			acc = &uModel.UserDetails{User: *createdUser}
+		}
+		// Check if user has MFA enabled
+		if acc.MFAEnabled {
+			// Create MFA session for OAuth2 auth
+			sessionToken, err := h.mfaService.GenerateSessionToken()
+			if err != nil {
+				logger.Error("Failed to generate MFA session token", "error", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Authentication failed"})
+				return
+			}
+
+			mfaSession := &uModel.MFASession{
+				SessionToken: sessionToken,
+				UserID:       acc.ID,
+				AuthMethod:   "oauth2",
+				Verified:     false,
+				CreatedAt:    time.Now().UTC(),
+				ExpiresAt:    time.Now().UTC().Add(10 * time.Minute),
+				UserData:     acc.Username,
+			}
+
+			if err := h.userRepo.CreateMFASession(c, mfaSession); err != nil {
+				logger.Error("Failed to create MFA session", "error", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Authentication failed"})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"mfaRequired":  true,
+				"sessionToken": sessionToken,
+			})
+			return
+		}
+		// Set profile image from OAuth provider if not already set
+		if acc.Image == "" && claims.Picture != "" {
+			err := h.userRepo.UpdateUserImage(c, acc.ID, claims.Picture)
+			if err != nil {
+				logger.Warn("Failed to update profile image", "userID", acc.ID, "err", err)
+			}
+		}
+		// Sync role from OIDC groups on every login (IdP is source of truth).
+		h.syncOIDCRole(c, acc.ID, acc.CircleID, claims.Groups)
+		// Generate tokens including refresh token:
+		tokenResponse, err := h.tokenService.GenerateTokens(c.Request.Context(), acc)
+		if err != nil {
+			logger.Errorw("Unable to generate tokens", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": "Unable to Generate a Token",
+			})
+			return
+		}
+		c.SetCookie("refresh_token", tokenResponse.RefreshToken, int(h.tokenService.RefreshTokenExpiry().Seconds()), "/", "", true, true)
+		c.JSON(http.StatusOK, tokenResponse)
 		return
 	}
 }
@@ -354,7 +866,7 @@ func (h *Handler) updateUserPassword(c *gin.Context) {
 	}
 	// read password from body:
 	type RequestBody struct {
-		Password string `json:"password" binding:"required,min=8,max=32"`
+		Password string `json:"password" binding:"required,min=8,max=64"`
 	}
 	var body RequestBody
 	if err := c.ShouldBindJSON(&body); err != nil {
@@ -390,6 +902,7 @@ func (h *Handler) UpdateUserDetails(c *gin.Context) {
 		DisplayName *string `json:"displayName" binding:"omitempty"`
 		ChatID      *int64  `json:"chatID" binding:"omitempty"`
 		Image       *string `json:"image" binding:"omitempty"`
+		Timezone    *string `json:"timezone" binding:"omitempty"`
 	}
 	user, ok := auth.CurrentUser(c)
 	if !ok {
@@ -407,7 +920,7 @@ func (h *Handler) UpdateUserDetails(c *gin.Context) {
 	}
 	// update non-nil fields:
 	if req.DisplayName != nil {
-		user.DisplayName = *req.DisplayName
+		user.DisplayName = html.EscapeString(*req.DisplayName)
 	}
 	if req.ChatID != nil {
 		user.ChatID = *req.ChatID
@@ -415,8 +928,17 @@ func (h *Handler) UpdateUserDetails(c *gin.Context) {
 	if req.Image != nil {
 		user.Image = *req.Image
 	}
+	if req.Timezone != nil {
+		if !utils.IsValidTimezone(*req.Timezone) {
+			c.JSON(400, gin.H{
+				"error": "Invalid timezone",
+			})
+			return
+		}
+		user.Timezone = *req.Timezone
+	}
 
-	if err := h.userRepo.UpdateUser(c, user); err != nil {
+	if err := h.userRepo.UpdateUser(c, &user.User); err != nil {
 		c.JSON(500, gin.H{
 			"error": "Error updating user",
 		})
@@ -431,13 +953,42 @@ func (h *Handler) CreateLongLivedToken(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get current user"})
 		return
 	}
+
 	type TokenRequest struct {
-		Name string `json:"name" binding:"required"`
+		Name    string `json:"name" binding:"required"`
+		MFACode string `json:"mfaCode"` // Optional MFA code for enhanced security
 	}
 	var req TokenRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
 		return
+	}
+
+	// If user has MFA enabled and provides an MFA code, verify it
+	if currentUser.MFAEnabled && req.MFACode != "" {
+		valid, newUsedCodes, err := h.mfaService.IsCodeValid(
+			currentUser.MFASecret,
+			currentUser.MFABackupCodes,
+			currentUser.MFARecoveryUsed,
+			req.MFACode,
+		)
+
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to validate MFA code"})
+			return
+		}
+
+		if !valid {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid MFA code"})
+			return
+		}
+
+		// Update used codes if a backup code was used
+		if newUsedCodes != currentUser.MFARecoveryUsed {
+			if err := h.userRepo.UpdateMFARecoveryCodes(c, currentUser.ID, newUsedCodes); err != nil {
+				logging.FromContext(c).Errorw("Failed to update recovery codes", "error", err)
+			}
+		}
 	}
 
 	// Step 1: Generate a secure random number
@@ -448,10 +999,9 @@ func (h *Handler) CreateLongLivedToken(c *gin.Context) {
 		return
 	}
 
-	timestamp := time.Now().Unix()
+	timestamp := time.Now().UTC().Unix()
 	hashInput := fmt.Sprintf("%s:%d:%x", currentUser.Username, timestamp, randomBytes)
 	hash := sha256.Sum256([]byte(hashInput))
-
 	token := hex.EncodeToString(hash[:])
 
 	tokenModel, err := h.userRepo.StoreAPIToken(c, currentUser.ID, req.Name, token)
@@ -460,7 +1010,14 @@ func (h *Handler) CreateLongLivedToken(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"res": tokenModel})
+	response := gin.H{"res": tokenModel}
+
+	// If user has MFA enabled but didn't provide a code, suggest using MFA for enhanced security
+	if currentUser.MFAEnabled && req.MFACode == "" {
+		response["message"] = "API token created successfully. For enhanced security, consider providing an MFA code when creating API tokens."
+	}
+
+	c.JSON(http.StatusOK, response)
 }
 
 func (h *Handler) GetAllUserToken(c *gin.Context) {
@@ -506,8 +1063,8 @@ func (h *Handler) UpdateNotificationTarget(c *gin.Context) {
 	}
 
 	type Request struct {
-		Type   nModel.NotificationType `json:"type"`
-		Target string                  `json:"target" binding:"required"`
+		Type   nModel.NotificationPlatform `json:"type"`
+		Target string                      `json:"target"`
 	}
 
 	var req Request
@@ -515,7 +1072,7 @@ func (h *Handler) UpdateNotificationTarget(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
 		return
 	}
-	if req.Type == nModel.NotificationTypeNone {
+	if req.Type == nModel.NotificationPlatformNone {
 		err := h.userRepo.DeleteNotificationTarget(c, currentUser.ID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete notification target"})
@@ -548,7 +1105,7 @@ func (h *Handler) updateUserPasswordLoggedInOnly(c *gin.Context) {
 	}
 	logger := logging.FromContext(c)
 	type RequestBody struct {
-		Password string `json:"password" binding:"required,min=8,max=32"`
+		Password string `json:"password" binding:"required,min=8,max=64"`
 	}
 	var body RequestBody
 	if err := c.ShouldBindJSON(&body); err != nil {
@@ -584,10 +1141,562 @@ func (h *Handler) updateUserPasswordLoggedInOnly(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{})
 }
 
-func Routes(router *gin.Engine, h *Handler, auth *jwt.GinJWTMiddleware, limiter *limiter.Limiter) {
+func (h *Handler) setWebhook(c *gin.Context) {
+	currentUser, ok := auth.CurrentUser(c)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get current user"})
+		return
+	}
 
-	userRoutes := router.Group("users")
-	userRoutes.Use(auth.MiddlewareFunc(), utils.RateLimitMiddleware(limiter))
+	type Request struct {
+		URL *string `json:"url"`
+	}
+
+	var req Request
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
+
+	if !currentUser.IsPlusMember() {
+		c.JSON(http.StatusForbidden, gin.H{"error": "This action is only available for Plus members"})
+		return
+	}
+
+	// get circle admins
+	admins, err := h.circleRepo.GetCircleAdmins(c, currentUser.CircleID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get circle details"})
+		return
+	}
+
+	// confirm that the user is an admin:
+	isAdmin := false
+	for _, admin := range admins {
+		if admin.ID == currentUser.ID {
+			isAdmin = true
+			break
+		}
+	}
+	if !isAdmin {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You are not an admin"})
+		return
+	}
+
+	err = h.circleRepo.SetWebhookURL(c, currentUser.CircleID, req.URL)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to set webhook URL"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{})
+}
+
+func (h *Handler) updateProfilePhoto(c *gin.Context) {
+	currentUser, ok := auth.CurrentUser(c)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get current user"})
+		return
+	}
+
+	file, err := c.FormFile("file")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid file"})
+		return
+	}
+	fileExtension := file.Filename[strings.LastIndex(file.Filename, "."):]
+	// validate file extension:
+	if fileExtension != ".jpg" && fileExtension != ".jpeg" && fileExtension != ".png" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid file extension"})
+		return
+	}
+
+	// Use a random UUID for the filename so the path is not guessable from
+	// the username — this matters when the bucket is configured for public
+	// reads (storage.public_read: true) and the URL is served unsigned.
+	filename := fmt.Sprintf("profiles/%s%s", uuid.New().String(), fileExtension)
+
+	openedFile, err := file.Open()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to open file"})
+		return
+	}
+	defer openedFile.Close()
+
+	err = h.storage.Save(c, filename, openedFile)
+	if err != nil {
+		logging.FromContext(c).Errorw("Failed to save profile photo", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save file"})
+		return
+	}
+
+	// Clean up the previous profile photo (if it was a locally-stored file,
+	// not an OIDC `picture` claim URL) so re-uploads don't accumulate orphans.
+	if prev := currentUser.Image; prev != "" &&
+		!strings.HasPrefix(prev, "http://") &&
+		!strings.HasPrefix(prev, "https://") {
+		if derr := h.storage.Delete(c, []string{prev}); derr != nil {
+			logging.FromContext(c).Warnw("Failed to delete previous profile photo", "path", prev, "error", derr)
+		}
+	}
+
+	// Store the raw storage path; URLs are minted on demand via
+	// URLSignerS3.SignIfLocal when the user is returned via
+	// GetUserProfile / users listing. In signed mode, SigV4 caps URL
+	// lifetime at 7 days, so persisting a pre-signed URL would leave
+	// stale references in the DB.
+	err = h.userRepo.UpdateUserImage(c, currentUser.ID, filename)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update profile photo"})
+		return
+	}
+	// Return a fresh URL (signed or public depending on config) so the
+	// client can display the upload immediately.
+	signedURL, err := h.signer.Sign(filename)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to sign URL"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"sign": signedURL})
+}
+
+func (h *Handler) getStorageUsage(c *gin.Context) {
+	currentUser, ok := auth.CurrentUser(c)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get current user"})
+		return
+	}
+
+	used, available, err := h.storageRepo.GetStorageStats(c, currentUser)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get storage usage"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"res": gin.H{
+			"used":  used,
+			"total": available,
+		},
+	})
+
+}
+
+// Account deletion request/response types
+type AccountDeletionRequest struct {
+	Password        string                 `json:"password" binding:"required"`
+	TransferOptions []CircleTransferOption `json:"transferOptions,omitempty"`
+	Confirmation    string                 `json:"confirmation" binding:"required"` // Must be "DELETE"
+}
+
+type AccountDeletionCheckRequest struct {
+	Password string `json:"password" binding:"required"`
+}
+
+func (h *Handler) checkAccountDeletion(c *gin.Context) {
+	currentUser, ok := auth.CurrentUser(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
+		return
+	}
+
+	var req AccountDeletionCheckRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Verify password
+	if auth.Matches(currentUser.Password, req.Password) != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid password"})
+		return
+	}
+
+	// Check what would be deleted (dry run)
+	result, err := h.deletionService.CheckUserAccountDeletion(c.Request.Context(), currentUser.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check account deletion: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+func (h *Handler) deleteAccount(c *gin.Context) {
+	currentUser, ok := auth.CurrentUser(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
+		return
+	}
+
+	var req AccountDeletionRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Validate confirmation text
+	if req.Confirmation != "DELETE" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Confirmation text must be 'DELETE'"})
+		return
+	}
+
+	// Verify password
+	if auth.Matches(currentUser.Password, req.Password) != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid password"})
+		return
+	}
+
+	// Perform account deletion
+	result, err := h.deletionService.DeleteUserAccount(c.Request.Context(), currentUser.ID, req.TransferOptions)
+	if err != nil {
+		logging.DefaultLogger().Errorf("Failed to delete account for user %d: %v", currentUser.ID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete account: " + err.Error()})
+		return
+	}
+
+	if !result.Success {
+		c.JSON(http.StatusBadRequest, result)
+		return
+	}
+
+	// Log the account deletion
+	logging.DefaultLogger().Infof("Account deleted successfully for user %d (%s)", currentUser.ID, currentUser.Username)
+
+	c.JSON(http.StatusOK, result)
+}
+
+// Child User Management endpoints
+
+// CreateChildUserRequest represents the request to create a child user
+type CreateChildUserRequest struct {
+	ChildName   string `json:"childName" binding:"required,min=2,max=20"`
+	DisplayName string `json:"displayName"`
+	Password    string `json:"password" binding:"required,min=8,max=64"`
+}
+
+// UpdateChildPasswordRequest represents the request to update a child user's password
+type UpdateChildPasswordRequest struct {
+	ChildUserID int    `json:"childUserId" binding:"required"`
+	Password    string `json:"password" binding:"required,min=8,max=64"`
+}
+
+// ChildUserResponse represents the response for child user operations
+type ChildUserResponse struct {
+	ID          int    `json:"id"`
+	Username    string `json:"username"`
+	DisplayName string `json:"displayName"`
+	UserType    string `json:"userType"`
+	CreatedAt   string `json:"createdAt"`
+}
+
+func (h *Handler) createChildUser(c *gin.Context) {
+	currentUser, ok := auth.CurrentUser(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
+		return
+	}
+
+	// Only parent users can create child users
+	if currentUser.UserType != uModel.UserTypeParent {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only parent users can create child accounts"})
+		return
+	}
+
+	var req CreateChildUserRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Check current child user count to enforce limit (only for donetick.com)
+	if h.isDonetickDotCom {
+		currentChildCount, err := h.userRepo.GetChildUserCount(c, currentUser.ID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check existing subaccounts"})
+			return
+		}
+
+		maxSubaccounts := h.maxSubaccounts
+		if currentUser.IsPlusMember() {
+			maxSubaccounts = h.plusMaxSubaccounts
+		}
+
+		if int(currentChildCount) >= maxSubaccounts {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": fmt.Sprintf("Maximum of %d subaccounts allowed per account", maxSubaccounts),
+			})
+			return
+		}
+	}
+	// Validate username and child username:
+	if !utils.IsValidUsername(currentUser.Username) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid parent username format"})
+		return
+	}
+	if !utils.IsValidUsername(req.ChildName) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid child username format"})
+		return
+	}
+
+	// Generate child username
+	childUsername := uModel.GenerateChildUsername(currentUser.Username, req.ChildName)
+
+	// Set default display name if not provided
+	if req.DisplayName == "" {
+		req.DisplayName = req.ChildName
+	}
+
+	// Encode password
+	encodedPassword, err := auth.EncodePassword(req.Password)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process password"})
+		return
+	}
+
+	// Create child user
+	childUser := &uModel.User{
+		Username:     childUsername,
+		DisplayName:  html.EscapeString(req.DisplayName),
+		Password:     encodedPassword,
+		CircleID:     currentUser.CircleID,
+		ParentUserID: &currentUser.ID,
+		UserType:     uModel.UserTypeChild,
+		Provider:     uModel.AuthProviderDonetick,
+		CreatedAt:    time.Now().UTC(),
+		UpdatedAt:    time.Now().UTC(),
+	}
+
+	// Validate child user
+	if err := childUser.ValidateChildUser(); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	createdUser, err := h.userRepo.CreateUser(c, childUser)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create child user"})
+		return
+	}
+
+	// Add child user to the same circle as parent
+	if err := h.circleRepo.AddUserToCircle(c, &cModel.UserCircle{
+		UserID:    createdUser.ID,
+		CircleID:  currentUser.CircleID,
+		Role:      "member", // Child users are members, not admins
+		IsActive:  true,
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to add child user to circle"})
+		return
+	}
+
+	response := ChildUserResponse{
+		ID:          createdUser.ID,
+		Username:    createdUser.Username,
+		DisplayName: createdUser.DisplayName,
+		UserType:    "child",
+		CreatedAt:   createdUser.CreatedAt.Format(time.RFC3339),
+	}
+
+	c.JSON(http.StatusCreated, gin.H{"res": response})
+}
+
+func (h *Handler) updateChildPassword(c *gin.Context) {
+	currentUser, ok := auth.CurrentUser(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
+		return
+	}
+
+	// Only parent users can update child passwords
+	if currentUser.UserType != uModel.UserTypeParent {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only parent users can update child passwords"})
+		return
+	}
+
+	var req UpdateChildPasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Verify that the child user belongs to the current parent
+	childUser, err := h.userRepo.GetUserByID(c, req.ChildUserID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Child user not found"})
+		return
+	}
+
+	if childUser.ParentUserID == nil || *childUser.ParentUserID != currentUser.ID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You can only update passwords for your own child users"})
+		return
+	}
+
+	// Encode new password
+	encodedPassword, err := auth.EncodePassword(req.Password)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process password"})
+		return
+	}
+
+	// Update password
+	err = h.userRepo.UpdatePasswordByUserId(c.Request.Context(), req.ChildUserID, encodedPassword)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update password"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Child user password updated successfully"})
+}
+
+func (h *Handler) deleteChildUser(c *gin.Context) {
+	currentUser, ok := auth.CurrentUser(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
+		return
+	}
+
+	// Only parent users can delete child users
+	if currentUser.UserType != uModel.UserTypeParent {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only parent users can delete child accounts"})
+		return
+	}
+
+	childUserID := c.Param("id")
+	if childUserID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Child user ID is required"})
+		return
+	}
+
+	// Parse child user ID
+	childID := 0
+	if _, err := fmt.Sscanf(childUserID, "%d", &childID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid child user ID"})
+		return
+	}
+
+	// Verify that the child user belongs to the current parent
+	childUser, err := h.userRepo.GetUserByID(c, childID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Child user not found"})
+		return
+	}
+
+	if childUser.ParentUserID == nil || *childUser.ParentUserID != currentUser.ID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You can only delete your own child users"})
+		return
+	}
+
+	// Delete child user account (this will cascade delete all associated data)
+	result, err := h.deletionService.DeleteUserAccount(c.Request.Context(), childID, nil)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete child user: " + err.Error()})
+		return
+	}
+
+	if !result.Success {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete child user"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Child user deleted successfully"})
+}
+
+func (h *Handler) getChildUsers(c *gin.Context) {
+	currentUser, ok := auth.CurrentUser(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
+		return
+	}
+
+	// Only parent users can view child users
+	if currentUser.UserType != uModel.UserTypeParent {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only parent users can view child accounts"})
+		return
+	}
+
+	childUsers, err := h.userRepo.GetChildUsersByParentID(c, currentUser.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get child users"})
+		return
+	}
+
+	var response []ChildUserResponse
+	for _, child := range childUsers {
+		response = append(response, ChildUserResponse{
+			ID:          child.ID,
+			Username:    child.Username,
+			DisplayName: child.DisplayName,
+			UserType:    "child",
+			CreatedAt:   child.CreatedAt.Format(time.RFC3339),
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{"res": response})
+}
+
+// RefreshRequest represents a refresh token request
+type RefreshRequest struct {
+	RefreshToken string `json:"refreshToken"`
+}
+
+// logout handles user logout by clearing cookies and revoking refresh tokens
+func (h *Handler) logout(c *gin.Context) {
+	logger := logging.FromContext(c)
+
+	// Try to get refresh token from cookie first (httpOnly), fallback to body
+	refreshToken, err := c.Cookie("refresh_token")
+	if err != nil {
+		// Fallback to JSON body for backward compatibility
+		var req RefreshRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			// No token provided, but logout should still succeed
+			refreshToken = ""
+		} else {
+			refreshToken = req.RefreshToken
+		}
+	}
+
+	// Revoke the refresh token if we have one
+	if refreshToken != "" {
+		// Hash the refresh token before looking it up (tokens are stored hashed)
+		tokenHash := hashToken(refreshToken)
+
+		// Get the session by token hash
+		session, err := h.userRepo.GetUserSessionByTokenHash(c.Request.Context(), tokenHash)
+		if err != nil {
+			logger.Infow("Refresh token session not found during logout", "note", "Token may already be expired or invalid")
+			// Don't return error - logout should always succeed from client perspective
+		} else {
+			// Revoke the session
+			if err := h.userRepo.RevokeSession(c.Request.Context(), session.ID); err != nil {
+				logger.Errorw("Failed to revoke session during logout", "error", err)
+				// Don't return error - logout should always succeed from client perspective
+			}
+		}
+	}
+
+	// Clear the httpOnly cookie by setting it with negative max age
+	c.SetCookie("refresh_token", "", 0, "/", "", true, true)
+
+	// Also clear any access token cookie if it exists
+	c.SetCookie("access_token", "", 0, "/", "", true, true)
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Logged out successfully",
+	})
+}
+
+// hashToken creates a SHA-256 hash of the token for database lookup
+func hashToken(token string) string {
+	hash := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(hash[:])
+}
+
+func Routes(router *gin.Engine, h *Handler, jwtAuth *jwt.GinJWTMiddleware, limiter *limiter.Limiter, cfg *config.Config) {
+
+	userRoutes := router.Group("api/v1/users")
+	userRoutes.Use(jwtAuth.MiddlewareFunc(), utils.RateLimitMiddleware(limiter))
 	{
 		userRoutes.GET("/", h.GetAllUsers())
 		userRoutes.GET("/profile", h.GetUserProfile)
@@ -595,20 +1704,52 @@ func Routes(router *gin.Engine, h *Handler, auth *jwt.GinJWTMiddleware, limiter 
 		userRoutes.POST("/tokens", h.CreateLongLivedToken)
 		userRoutes.GET("/tokens", h.GetAllUserToken)
 		userRoutes.DELETE("/tokens/:id", h.DeleteUserToken)
+		userRoutes.PUT("/webhook", h.setWebhook)
 		userRoutes.PUT("/targets", h.UpdateNotificationTarget)
 		userRoutes.PUT("change_password", h.updateUserPasswordLoggedInOnly)
+		userRoutes.POST("profile_photo", h.updateProfilePhoto)
+		userRoutes.GET("storage", h.getStorageUsage)
+		userRoutes.POST("/logout", h.logout) // Logout endpoint to clear cookies and expire refresh tokens
 
+		// MFA endpoints
+		userRoutes.GET("/mfa/status", h.getMFAStatus)
+		userRoutes.POST("/mfa/setup", h.setupMFA)
+		userRoutes.POST("/mfa/confirm", h.confirmMFA)
+		userRoutes.POST("/mfa/disable", h.disableMFA)
+		// userRoutes.POST("/mfa/regenerate-backup-codes", h.regenerateBackupCodes)
+
+		// Account deletion endpoints
+		userRoutes.POST("/delete/check", h.checkAccountDeletion)
+		userRoutes.DELETE("/delete", h.deleteAccount)
+
+		// Child user management endpoints
+		userRoutes.POST("/subaccounts", h.createChildUser)
+		userRoutes.GET("/subaccounts", h.getChildUsers)
+		userRoutes.PUT("/subaccounts/password", h.updateChildPassword)
+		userRoutes.DELETE("/subaccounts/:id", h.deleteChildUser)
 	}
 
-	authRoutes := router.Group("auth")
+	// Create new auth handler for enhanced token management
+	authHandler := auth.NewAuthHandler(h.tokenService, h.userRepo, jwtAuth, h.mfaService)
+
+	authRoutes := router.Group("api/v1/auth")
 	authRoutes.Use(utils.RateLimitMiddleware(limiter))
 	{
 		authRoutes.POST("/:provider/callback", h.thirdPartyAuthCallback)
 		authRoutes.POST("/", h.signUp)
-		authRoutes.POST("login", auth.LoginHandler)
-		authRoutes.GET("refresh", auth.RefreshHandler)
+		authRoutes.POST("login", authHandler.EnhancedLoginHandler)  // Enhanced login with refresh tokens
+		authRoutes.POST("login/legacy", jwtAuth.LoginHandler)       // Legacy login for backward compatibility
+		authRoutes.POST("refresh", authHandler.RefreshTokenHandler) // Changed from GET to POST
+		authRoutes.POST("logout", authHandler.LogoutHandler)        // New logout endpoint
 		authRoutes.POST("reset", h.resetPassword)
 		authRoutes.POST("password", h.updateUserPassword)
+		authRoutes.POST("mfa/verify", h.verifyMFA) // Add MFA verification endpoint
 	}
 
+	// Protected auth routes (require JWT)
+	protectedAuthRoutes := router.Group("api/v1/auth")
+	protectedAuthRoutes.Use(jwtAuth.MiddlewareFunc(), utils.RateLimitMiddleware(limiter))
+	{
+		protectedAuthRoutes.POST("revoke-all", authHandler.RevokeAllHandler) // New revoke all endpoint
+	}
 }

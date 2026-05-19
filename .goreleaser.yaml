@@ -8,12 +8,13 @@
 
 version: 2
 
-# before:
-#   hooks:
-#     # You may remove this if you don't use go modules.
-#     - go mod tidy
-#     # you may remove this if you don't need go generate
-#     - go generate ./...
+before:
+  hooks:
+    # - go mod tidy
+    # Add this line to trigger Swagger generation
+    - go install github.com/swaggo/swag/cmd/swag@latest
+    - sh -c '$(go env GOPATH)/bin/swag init -g docs/handler.go'
+
 
 builds:
   - env:
@@ -21,7 +22,8 @@ builds:
     goos:
       - linux
       - darwin
-
+    ldflags:
+      - "-X donetick.com/core/config.Version={{.Version}} -X donetick.com/core/config.Commit={{.Commit}} -X donetick.com/core/config.BuildDate={{.Date}}"
     targets:
       - linux_amd64_v1
       - darwin_arm64
@@ -49,9 +51,14 @@ archives:
         dst: "config/local.yaml"
       - src: "config/selfhosted.yaml"
         dst: "config/selfhosted.yaml"
+release:
+  prerelease: auto  # Auto-detect pre-releases based on semver (e.g., v1.0.0-beta.1)
+  draft: false
+  header: |
+    {{ if .Prerelease -}}
+    > [!WARNING]
+    > This release is intended for testing purposes only. Please do not use it with production data, as frequent updates and architectural changes may occur between pre-release versions.
+    {{ end -}}
+
 changelog:
-  sort: asc
-  filters:
-    exclude:
-      - "^docs:"
-      - "^test:"
+  use: github

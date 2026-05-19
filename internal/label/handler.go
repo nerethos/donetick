@@ -3,7 +3,7 @@ package label
 import (
 	"strconv"
 
-	auth "donetick.com/core/internal/authorization"
+	auth "donetick.com/core/internal/auth"
 	lModel "donetick.com/core/internal/label/model"
 	lRepo "donetick.com/core/internal/label/repo"
 	jwt "github.com/appleboy/gin-jwt/v2"
@@ -74,6 +74,7 @@ func (h *Handler) createLabel(c *gin.Context) {
 		Name:      req.Name,
 		Color:     req.Color,
 		CreatedBy: currentUser.ID,
+		CircleID:  &currentUser.CircleID,
 	}
 	if err := h.lRepo.CreateLabels(c, []*lModel.Label{label}); err != nil {
 		c.JSON(500, gin.H{
@@ -105,9 +106,10 @@ func (h *Handler) updateLabel(c *gin.Context) {
 	}
 
 	label := &lModel.Label{
-		Name:  req.Name,
-		Color: req.Color,
-		ID:    req.ID,
+		Name:     req.Name,
+		Color:    req.Color,
+		ID:       req.ID,
+		CircleID: &currentUser.CircleID,
 	}
 	if err := h.lRepo.UpdateLabel(c, currentUser.ID, label); err != nil {
 		c.JSON(500, gin.H{
@@ -164,7 +166,7 @@ func (h *Handler) deleteLabel(c *gin.Context) {
 
 func Routes(r *gin.Engine, h *Handler, auth *jwt.GinJWTMiddleware) {
 
-	labelRoutes := r.Group("labels")
+	labelRoutes := r.Group("api/v1/labels")
 	labelRoutes.Use(auth.MiddlewareFunc())
 	{
 		labelRoutes.GET("", h.getLabels)
